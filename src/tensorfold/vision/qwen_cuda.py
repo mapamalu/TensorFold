@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import json
 import threading
@@ -44,7 +44,7 @@ class EncodedVision:
 def vision_config(model_dir: str | Path) -> dict:
     raw = json.loads((Path(model_dir) / "config.json").read_text())
     config = raw.get("vision_config")
-    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen4_exp"):
+    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen4_exp", "qwen3_5_vision"):
         raise ValueError("CUDA vision requires a Qwen3.5-compatible vision checkpoint")
     if config.get("deepstack_visual_indexes"):
         raise ValueError("CUDA Qwen vision does not support deepstack image features")
@@ -69,6 +69,11 @@ def vision_config(model_dir: str | Path) -> dict:
     return config
 
 
+def checkpoint_supports_video(config: dict) -> bool:
+    """Riconosce i checkpoint Flash Next con token video, inclusi gli alias Mia-AiLab."""
+    return config.get("model_type") in {"qwen4_exp", "qwen3_8_flash_next"} and "video_token_id" in config
+
+
 def _vision_sources(model_dir):
     from .qwen_checkpoint import vision_tensors
 
@@ -84,9 +89,13 @@ def checkpoint_vision(model_dir: str | Path) -> tuple[dict, int]:
     tensors = {k: value[1] for k, value in sources.items()}
     for name, (path, info, begin) in sources.items():
         shape, offsets = info.get("shape", ()), info.get("data_offsets", ())
-        if (info.get("dtype") not in {"BF16", "F16", "F32"} or not shape
+        dtype = info.get("dtype")
+        is_scale2 = name.endswith(".weight_scale_2")
+        if (dtype not in {"BF16", "F16", "F32", "U8", "F8_E4M3"} or dtype not in SIZES
+                or (not shape and not is_scale2) or (is_scale2 and shape)
                 or any(type(d) is not int or d <= 0 for d in shape) or len(offsets) != 2
                 or any(type(d) is not int for d in offsets) or offsets[0] < 0
+                or offsets[1] < offsets[0]
                 or offsets[1] - offsets[0] != math.prod(shape) * SIZES[info["dtype"]]
                 or begin + offsets[1] > path.stat().st_size):
             raise ValueError(f"invalid or unsupported vision tensor range: {name}")
@@ -101,17 +110,60 @@ def checkpoint_vision(model_dir: str | Path) -> tuple[dict, int]:
                                     ("attn.proj", h, h), ("mlp.linear_fc1", mid, h), ("mlp.linear_fc2", h, mid)):
             shapes[f"blocks.{layer}.{part}.weight"] = [width] if inputs is None else [width, inputs]
             shapes[f"blocks.{layer}.{part}.bias"] = [width]
-    if set(tensors) != set(shapes) | {"patch_embed.proj.weight"}:
-        raise ValueError("checkpoint needs the complete unquantized Qwen vision tower; use its original MLX checkpoint")
-    if any(tensors[key]["shape"] != expected for key, expected in shapes.items()):
-        raise ValueError("vision tensor shapes differ from the checkpoint configuration")
-    if any(v["dtype"] not in {"BF16", "F16", "F32"} for v in tensors.values()):
-        raise ValueError("CUDA vision requires floating-point vision weights")
+    root = json.loads((Path(model_dir) / "config.json").read_text())
+    from tensorfold.cuda.nvfp4.format import config_block
+
+    quant_config = config_block(root) or {}
+    quant_method = str(quant_config.get("quant_method", "")).lower()
+    allowed = set(shapes) | {"patch_embed.proj.weight"}
+    quant_metadata = set()
+    for name, expected in shapes.items():
+        if name not in tensors:
+            raise ValueError(f"vision checkpoint is missing tensor: {name}")
+        if not name.endswith(".weight"):
+            if tensors[name]["shape"] != expected or tensors[name]["dtype"] not in {"BF16", "F16", "F32"}:
+                raise ValueError(f"vision tensor shape or dtype differs from the checkpoint configuration: {name}")
+            continue
+        info = tensors[name]
+        dtype, shape = info["dtype"], info["shape"]
+        base = name[:-7]
+        scale_name, scale2_name = base + ".weight_scale", base + ".weight_scale_2"
+        if dtype == "U8":
+            if quant_method != "modelopt" or len(expected) != 2 or expected[1] % 16 \
+                    or shape != [expected[0], expected[1] // 2]:
+                raise ValueError(f"unsupported ModelOpt NVFP4 vision weight shape: {name}")
+            scale = tensors.get(scale_name)
+            scale2 = tensors.get(scale2_name)
+            if (scale is None or scale["dtype"] != "F8_E4M3"
+                    or scale["shape"] != [expected[0], expected[1] // 16]
+                    or scale2 is None or scale2["dtype"] != "F32" or scale2["shape"] != []):
+                raise ValueError(f"{name}: incomplete ModelOpt NVFP4 scale triplet")
+            quant_metadata.update((scale_name, scale2_name))
+        elif dtype == "F8_E4M3":
+            if quant_method != "modelopt" or shape != expected or len(expected) != 2 or expected[1] % 32:
+                raise ValueError(f"unsupported ModelOpt MXFP8 vision weight shape: {name}")
+            scale = tensors.get(scale_name)
+            if scale is None or scale["dtype"] != "U8" or scale["shape"] != [expected[0], expected[1] // 32]:
+                raise ValueError(f"{name}: incomplete ModelOpt MXFP8 weight and scale pair")
+            if scale2_name in tensors:
+                raise ValueError(f"{name}: MXFP8 must not have weight_scale_2")
+            quant_metadata.add(scale_name)
+        elif dtype in {"BF16", "F16", "F32"}:
+            if shape != expected or scale_name in tensors or scale2_name in tensors:
+                raise ValueError(f"floating-point vision weight has quantization metadata or a wrong shape: {name}")
+        else:
+            raise ValueError(f"unsupported vision weight dtype {dtype}: {name}")
+    if tensors.get("patch_embed.proj.weight", {}).get("dtype") not in {"BF16", "F16", "F32"}:
+        raise ValueError("patch embedding must remain a floating-point tensor")
+    if set(tensors) != allowed | quant_metadata:
+        raise ValueError("checkpoint needs a complete Qwen vision tower with recognized ModelOpt scales")
     h, p, t, channels = (config[k] for k in ("hidden_size", "patch_size", "temporal_patch_size", "in_channels"))
     shape = tensors["patch_embed.proj.weight"]["shape"]
     if shape not in ([h, t, p, p, channels], [h, channels, t, p, p]):
         raise ValueError("unsupported vision patch convolution layout")
-    return config, sum(math.prod(v["shape"]) * max(2, SIZES[v["dtype"]]) for v in tensors.values())
+    resident = sum(math.prod(shapes.get(name, info["shape"])) * 2
+                   for name, info in tensors.items() if name not in quant_metadata)
+    return config, resident
 
 
 def weight_transform(base, enabled: bool, rank: int, offload: bool = False):
@@ -122,8 +174,10 @@ def weight_transform(base, enabled: bool, rank: int, offload: bool = False):
             if rank != 0 or offload or os.environ.get("TENSORFOLD_VISION_WEIGHTS"):
                 return 0, 0                     # offloaded: resident in host RAM between images
             from tensorfold.cuda.capacity import SIZES
-
-            return math.prod(info["shape"]) * max(2, SIZES[info["dtype"]]), 0
+            if name.endswith((".weight_scale", ".weight_scale_2")):
+                return 0, 0
+            multiplier = 4 if name.endswith(".weight") and info["dtype"] == "U8" else 2
+            return math.prod(info["shape"]) * max(multiplier, SIZES[info["dtype"]]), 0
         return base(name, info)
     return transform
 
@@ -167,7 +221,7 @@ class QwenCudaVision:
         raw = json.loads((Path(model_dir) / "config.json").read_text())
         self.image_token = int(raw["image_token_id"])
         # videos: Flash Next's frontend (the frame groups ride the image path; tested on that checkpoint)
-        self.videos = raw.get("model_type") == "qwen4_exp" and "video_token_id" in raw
+        self.videos = checkpoint_supports_video(raw)
         self.media_tokens = frozenset({self.image_token} | ({int(raw["video_token_id"])} if self.videos else set()))
         self.device = device
         config = Qwen3_5VisionConfig(**{k: v for k, v in self.config.items()
@@ -175,18 +229,25 @@ class QwenCudaVision:
         config._attn_implementation = "sdpa"
         with torch.device("meta"):
             tower = Qwen3_5VisionModel(config)
-        tensors = {}
-        by_file = {}
-        for key, (path, info, begin) in _vision_sources(model_dir).items():
-            by_file.setdefault(path, {})[key] = info
-        for path, selected in by_file.items():
-            with safe_open(str(path), framework="pt", device="cpu") as source:
+        sources = _vision_sources(model_dir)
+        with ExitStack() as stack:
+            by_path = {}
+            for path in sorted({item[0] for item in sources.values()}):
+                source = stack.enter_context(safe_open(str(path), framework="pt", device="cpu"))
                 names = {vision_key(name): name for name in source.keys()}
-                for key in selected:
-                    value = source.get_tensor(names[key])
-                    if key == "patch_embed.proj.weight" and value.shape[-1] == self.config["in_channels"]:
-                        value = value.permute(0, 4, 1, 2, 3).contiguous()
-                    tensors[key] = value.to(device=resident, dtype=torch.bfloat16)
+                by_path[path] = (source, names)
+
+            def read_tensor(key):
+                path = sources[key][0]
+                source, names = by_path[path]
+                return source.get_tensor(names[key])
+
+            from .qwen_checkpoint import load_vision_torch_weights
+
+            tensors = load_vision_torch_weights(sources, read_tensor, resident)
+        patch = tensors["patch_embed.proj.weight"]
+        if patch.shape[-1] == self.config["in_channels"]:
+            tensors["patch_embed.proj.weight"] = patch.permute(0, 4, 1, 2, 3).contiguous()
         tower.load_state_dict(tensors, strict=True, assign=True)
         rotary_frequencies(tower.rotary_pos_emb, self.config, resident)
         self.tower = tower.eval()

@@ -55,6 +55,28 @@ class ImageProcessor:
         return {"pixel_values": np.zeros((16, 1536), np.float32), "image_grid_thw": np.array([[1, 4, 4]])}
 
 
+def test_flash_next_checkpoint_loads_local_video_processor(tmp_path, monkeypatch):
+    config = {"model_type": "qwen3_8_flash_next", "image_token_id": 10, "video_token_id": 11,
+              "vision_start_token_id": 8, "vision_end_token_id": 9,
+              "vision_config": {"patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    class FlashTokenizer(Tokenizer):
+        def convert_ids_to_tokens(self, token):
+            return "<video>" if token == 11 else super().convert_ids_to_tokens(token)
+
+        def convert_tokens_to_ids(self, token):
+            return 11 if token == "<video>" else super().convert_tokens_to_ids(token)
+
+    runtime = (SimpleNamespace(from_pretrained=lambda *_a, **_kw: FlashTokenizer()), ImageProcessor)
+    monkeypatch.setattr(qwen_processing, "_processor_runtime", lambda: runtime)
+
+    frontend = qwen_processing.QwenImageProcessor.from_directory(tmp_path)
+
+    assert frontend.image_token == "<image>"
+    assert frontend.video_marker == "<start><video><end>"
+
+
 def image(name="one", detail="auto"):
     return SimpleNamespace(content_hash=name, detail=detail, to_pil=lambda: "PIL:" + name)
 

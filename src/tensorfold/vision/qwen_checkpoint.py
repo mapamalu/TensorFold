@@ -101,6 +101,106 @@ def load_vision_weights(tensors: dict[str, tuple[Path, dict, int]], mx: Any) -> 
     return weights
 
 
+def dequantize_vision_nvfp4(weight: np.ndarray, scale: np.ndarray, scale2: float) -> np.ndarray:
+    """Decodifica NVFP4 ModelOpt [N,K/2] in pesi float32 [N,K] secondo il layout salvato."""
+    from tensorfold.cuda.nvfp4 import format as nvfp4
+
+    weight = np.asarray(weight)
+    scale = np.asarray(scale)
+    if weight.dtype != np.uint8 or weight.ndim != 2 or weight.shape[1] % 8:
+        raise ValueError("pesi visivi NVFP4 non validi: attesi byte [N,K/2] con K divisibile per 16")
+    rows, half = weight.shape
+    width = half * 2
+    if scale.dtype != np.uint8 or scale.shape != (rows, width // 16):
+        raise ValueError("scale visive NVFP4 non valide: attese scale E4M3 [N,K/16]")
+    if not np.isfinite(scale2) or scale2 <= 0:
+        raise ValueError("weight_scale_2 NVFP4 deve essere uno scalare positivo e finito")
+    decoded_scale = nvfp4.e4m3(scale)
+    if not np.isfinite(decoded_scale).all() or np.any(decoded_scale < 0):
+        raise ValueError("le scale E4M3 visive NVFP4 contengono valori non validi")
+    result = nvfp4.dequant("nvfp4", weight, scale, float(scale2))
+    if not np.isfinite(result).all():
+        raise ValueError("la decodifica NVFP4 visiva ha prodotto valori non finiti")
+    return result
+
+
+def dequantize_vision_mxfp8(weight_bits: np.ndarray, scale_bits: np.ndarray) -> np.ndarray:
+    """Decodifica pesi visivi MXFP8 E4M3 con scale E8M0 per gruppi di 32 elementi."""
+    from tensorfold.cuda.nvfp4 import format as nvfp4
+
+    weight_bits = np.asarray(weight_bits)
+    scale_bits = np.asarray(scale_bits)
+    if weight_bits.dtype != np.uint8 or weight_bits.ndim != 2 or weight_bits.shape[1] % 32:
+        raise ValueError("pesi visivi MXFP8 non validi: attesi bit E4M3 [N,K] con K divisibile per 32")
+    expected = (weight_bits.shape[0], weight_bits.shape[1] // 32)
+    if scale_bits.dtype != np.uint8 or scale_bits.shape != expected:
+        raise ValueError("scale visive MXFP8 non valide: attesi byte E8M0 [N,K/32]")
+    decoded_weight = nvfp4.e4m3(weight_bits)
+    decoded_scale = nvfp4.e8m0(scale_bits)
+    if not np.isfinite(decoded_weight).all() or not np.isfinite(decoded_scale).all():
+        raise ValueError("i tensori visivi MXFP8 contengono codici non finiti")
+    result = nvfp4.dequant("mxfp8", weight_bits, scale_bits)
+    if not np.isfinite(result).all():
+        raise ValueError("la decodifica MXFP8 visiva ha prodotto valori non finiti")
+    return result
+
+
+def load_vision_torch_weights(sources: dict[str, tuple[Path, dict, int]], read_tensor: Any,
+                              device: Any) -> dict[str, Any]:
+    """Carica la torre Qwen CUDA in BF16, espandendo solo i moduli ModelOpt NVFP4 e MXFP8."""
+    import torch
+
+    weights = {}
+    consumed = set()
+
+    def raw_bytes(name: str, tensor: Any) -> np.ndarray:
+        dtype = sources[name][1]["dtype"]
+        if dtype == "F8_E4M3":
+            tensor = tensor.view(torch.uint8)
+        elif dtype != "U8":
+            raise ValueError(f"{name}: la rappresentazione quantizzata deve essere byte U8 o F8_E4M3")
+        return tensor.detach().to(device="cpu").contiguous().numpy()
+
+    for name in sorted(sources):
+        if name in consumed:
+            continue
+        if name.endswith((".weight_scale", ".weight_scale_2")):
+            raise ValueError(f"metadato di quantizzazione visivo senza peso associato: {name}")
+        item = sources[name][1]
+        dtype = item["dtype"]
+        if name.endswith(".weight") and dtype in ("U8", "F8_E4M3"):
+            base = name[:-7]
+            scale_name, scale2_name = base + ".weight_scale", base + ".weight_scale_2"
+            if scale_name not in sources:
+                raise ValueError(f"{name}: manca weight_scale per il peso visivo quantizzato")
+            packed = raw_bytes(name, read_tensor(name))
+            scale = raw_bytes(scale_name, read_tensor(scale_name))
+            consumed.update((name, scale_name))
+            if dtype == "U8":
+                if scale2_name not in sources or sources[scale2_name][1]["dtype"] != "F32":
+                    raise ValueError(f"{name}: NVFP4 richiede weight_scale_2 F32 scalare")
+                scale2 = read_tensor(scale2_name)
+                if scale2.numel() != 1 or tuple(scale2.shape) != ():
+                    raise ValueError(f"{scale2_name}: atteso uno scalare F32")
+                decoded = dequantize_vision_nvfp4(packed, scale, float(scale2.item()))
+                consumed.add(scale2_name)
+            else:
+                if scale2_name in sources:
+                    raise ValueError(f"{name}: MXFP8 non ammette weight_scale_2")
+                decoded = dequantize_vision_mxfp8(packed, scale)
+            value = torch.from_numpy(np.ascontiguousarray(decoded)).to(dtype=torch.bfloat16)
+        else:
+            if dtype not in ("BF16", "F16", "F32"):
+                raise ValueError(f"{name}: formato visivo non quantizzato non supportato ({dtype})")
+            value = read_tensor(name)
+        weights[name] = value.to(device=device, dtype=torch.bfloat16)
+        consumed.add(name)
+
+    if consumed != set(sources):
+        raise ValueError(f"tensori visivi non caricati: {sorted(set(sources) - consumed)[:5]}")
+    return weights
+
+
 def quantization_predicate(config: dict, weights: dict[str, Any]):
     """Respect per-module overrides only where the checkpoint actually contains packed tensors."""
     quant = config.get("quantization") or config.get("quantization_config") or {}

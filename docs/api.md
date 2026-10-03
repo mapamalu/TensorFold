@@ -27,8 +27,9 @@ chat fields that shape the prompt (`tools`, `reasoning_effort`, `chat_template_k
 request, images expanded. `/detokenize` takes `tokens` and returns `prompt`.
 With `--vision`, supported Qwen3.5/3.8 dense checkpoints accept `image_url` content parts alongside text in user
 messages and in tool results (`role: "tool"`), such as an agent's screenshots.
-See [image input](vision.md) for data URLs, public image URLs, limits and cache behavior.
-Unsupported image input, audio, video and non-text output requests receive HTTP 400.
+CUDA Flash Next checkpoints also accept `video_url` parts in user messages when served with `--vision` and
+`--parallel` of at least two. See [image and video input](vision.md) for data URLs, public media URLs, limits and
+cache behavior. Unsupported image or video input, audio and non-text output requests receive HTTP 400.
 
 ## Decisions
 

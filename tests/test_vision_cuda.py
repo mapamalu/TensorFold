@@ -14,29 +14,54 @@ from tensorfold.vision.qwen_cuda import (EncodedVision, broadcast_encoded, capac
                                        checkpoint_vision, validate_encoded, weight_transform)
 
 
-def _checkpoint(path):
-    vision = {"model_type": "qwen3_5", "hidden_size": 8, "out_hidden_size": 8, "depth": 1,
+def _checkpoint(path, *, hidden=8, intermediate=12, quantized=None):
+    quantized = quantized or {}
+    vision = {"model_type": "qwen3_5", "hidden_size": hidden, "out_hidden_size": hidden, "depth": 1,
               "patch_size": 2, "temporal_patch_size": 2, "spatial_merge_size": 2, "in_channels": 3,
-              "intermediate_size": 12, "num_heads": 2, "num_position_embeddings": 4}
+              "intermediate_size": intermediate, "num_heads": 2, "num_position_embeddings": 4}
     config = {"model_type": "qwen3_5", "vision_config": vision, "text_config": {
-        "hidden_size": 8, "head_dim": 8, "rope_parameters": {"mrope_interleaved": True,
-        "mrope_section": [2, 1, 1], "partial_rotary_factor": 1}}}
+        "hidden_size": hidden, "head_dim": hidden, "rope_parameters": {"mrope_interleaved": True,
+        "mrope_section": [hidden // 4, hidden // 8, hidden // 8], "partial_rotary_factor": 1}}}
+    if quantized:
+        config["quantization_config"] = {"quant_method": "modelopt"}
     (path / "config.json").write_text(json.dumps(config))
-    shapes = {"patch_embed.proj.weight": [8, 2, 2, 2, 3], "patch_embed.proj.bias": [8],
-              "pos_embed.weight": [4, 8], "merger.norm.weight": [8], "merger.norm.bias": [8],
-              "merger.linear_fc1.weight": [32, 32], "merger.linear_fc1.bias": [32],
-              "merger.linear_fc2.weight": [8, 32], "merger.linear_fc2.bias": [8]}
-    for part, shape in {"norm1": [8], "norm2": [8], "attn.qkv": [24, 8], "attn.proj": [8, 8],
-                        "mlp.linear_fc1": [12, 8], "mlp.linear_fc2": [8, 12]}.items():
+    merged = hidden * vision["spatial_merge_size"] ** 2
+    shapes = {"patch_embed.proj.weight": [hidden, 2, 2, 2, 3], "patch_embed.proj.bias": [hidden],
+              "pos_embed.weight": [4, hidden], "merger.norm.weight": [hidden], "merger.norm.bias": [hidden],
+              "merger.linear_fc1.weight": [merged, merged], "merger.linear_fc1.bias": [merged],
+              "merger.linear_fc2.weight": [hidden, merged], "merger.linear_fc2.bias": [hidden]}
+    for part, shape in {"norm1": [hidden], "norm2": [hidden], "attn.qkv": [3 * hidden, hidden],
+                        "attn.proj": [hidden, hidden], "mlp.linear_fc1": [intermediate, hidden],
+                        "mlp.linear_fc2": [hidden, intermediate]}.items():
         shapes[f"blocks.0.{part}.weight"] = shape
         shapes[f"blocks.0.{part}.bias"] = [shape[0]]
-    offset, entries = 0, {}
-    for name, shape in shapes.items():
-        size = int(np.prod(shape)) * 2
-        entries["vision_tower." + name] = {"dtype": "BF16", "shape": shape, "data_offsets": [offset, offset + size]}
+    offset, entries, logical_size = 0, {}, 0
+    sizes = {"BF16": 2, "F16": 2, "F32": 4, "U8": 1, "F8_E4M3": 1}
+
+    def add(name, dtype, shape):
+        nonlocal offset
+        size = int(np.prod(shape)) * sizes[dtype]
+        entries["vision_tower." + name] = {"dtype": dtype, "shape": shape,
+                                           "data_offsets": [offset, offset + size]}
         offset += size
+
+    for name, shape in shapes.items():
+        scheme = quantized.get(name)
+        if scheme == "nvfp4":
+            assert name.endswith(".weight") and len(shape) == 2 and shape[1] % 16 == 0
+            add(name, "U8", [shape[0], shape[1] // 2])
+            base = name[:-7]
+            add(base + ".weight_scale", "F8_E4M3", [shape[0], shape[1] // 16])
+            add(base + ".weight_scale_2", "F32", [])
+        elif scheme == "mxfp8":
+            assert name.endswith(".weight") and len(shape) == 2 and shape[1] % 32 == 0
+            add(name, "F8_E4M3", shape)
+            add(name[:-7] + ".weight_scale", "U8", [shape[0], shape[1] // 32])
+        else:
+            add(name, "BF16", shape)
+        logical_size += int(np.prod(shape)) * 2
     _write_tensors(path, entries, offset)
-    return entries, offset
+    return entries, offset, logical_size
 
 
 def _write_tensors(path, entries, size):
@@ -44,8 +69,32 @@ def _write_tensors(path, entries, size):
     (path / "model.safetensors").write_bytes(struct.pack("<Q", len(raw)) + raw + bytes(size))
 
 
+def test_cuda_vision_config_accepts_mia_qwen38_vision_subtype(tmp_path):
+    config = {"model_type": "qwen3_8_flash_next", "text_config": {
+        "hidden_size": 2560, "head_dim": 256,
+        "rope_parameters": {"mrope_interleaved": True, "mrope_section": [11, 11, 10],
+                             "partial_rotary_factor": 0.25}},
+        "vision_config": {"model_type": "qwen3_5_vision", "hidden_size": 1024, "out_hidden_size": 2560,
+                          "depth": 24, "patch_size": 14, "temporal_patch_size": 2,
+                          "spatial_merge_size": 2, "in_channels": 3, "intermediate_size": 4096,
+                          "num_heads": 16, "num_position_embeddings": 2304}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    from tensorfold.vision.qwen_cuda import vision_config
+
+    assert vision_config(tmp_path) == config["vision_config"]
+
+
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen3_8_flash_next"])
+def test_cuda_vision_video_capability_covers_flash_next_aliases(model_type):
+    from tensorfold.vision.qwen_cuda import checkpoint_supports_video
+
+    assert checkpoint_supports_video({"model_type": model_type, "video_token_id": 11})
+    assert not checkpoint_supports_video({"model_type": model_type})
+
+
 def test_vision_headers_do_not_load_tensor_payloads(tmp_path):
-    _, size = _checkpoint(tmp_path)
+    _, size, _ = _checkpoint(tmp_path)
     config, resident = checkpoint_vision(tmp_path)
     assert config["out_hidden_size"] == 8
     assert resident == size
@@ -53,7 +102,7 @@ def test_vision_headers_do_not_load_tensor_payloads(tmp_path):
 
 @pytest.mark.parametrize("damage", ["missing", "quantized", "range", "shape"])
 def test_incomplete_or_incompatible_towers_refuse_before_loading(tmp_path, damage):
-    entries, size = _checkpoint(tmp_path)
+    entries, size, _ = _checkpoint(tmp_path)
     key = "vision_tower.blocks.0.attn.qkv.weight"
     if damage == "missing":
         del entries[key]
@@ -84,15 +133,19 @@ def test_vision_memory_is_reserved_only_on_the_tower_rank(tmp_path):
     from tensorfold.cuda.capacity import Geometry
 
     _checkpoint(tmp_path)
-    base = lambda text: Geometry(lambda slots: slots * 64, 8)
+    def base(text):
+        return Geometry(lambda slots: slots * 64, 8)
     zero = capacity_geometry(base, tmp_path, True, 0)({})
     one = capacity_geometry(base, tmp_path, True, 1)({})
     plain = capacity_geometry(base, tmp_path, False, 0)({})
     assert zero.needed(32) > one.needed(32) > plain.needed(32)
-    original = lambda *args: (0, 0)
+    def original(*args):
+        return 0, 0
     info = {"shape": [8, 8], "dtype": "BF16"}
     assert weight_transform(original, True, 0)("vision_tower.x", info) == (128, 0)
     assert weight_transform(original, True, 1)("vision_tower.x", info) == (0, 0)
+    assert weight_transform(original, True, 0)("vision_tower.x.weight", {"shape": [8, 8], "dtype": "U8"}) == (256, 0)
+    assert weight_transform(original, True, 0)("vision_tower.x.weight_scale", {"shape": [8, 1], "dtype": "U8"}) == (0, 0)
 
 
 def test_offloaded_tower_leaves_the_gpu_budget_but_keeps_a_smaller_workspace(tmp_path):
@@ -100,16 +153,116 @@ def test_offloaded_tower_leaves_the_gpu_budget_but_keeps_a_smaller_workspace(tmp
     from tensorfold.vision.qwen_cuda import OFFLOAD_WORKSPACE_BYTES, WORKSPACE_BYTES
 
     _checkpoint(tmp_path)
-    base = lambda text: Geometry(lambda slots: slots * 64, 8)
+    def base(text):
+        return Geometry(lambda slots: slots * 64, 8)
     resident = capacity_geometry(base, tmp_path, True, 0)({})
     offloaded = capacity_geometry(base, tmp_path, True, 0, offload=True)({})
     plain = capacity_geometry(base, tmp_path, False, 0)({})
     assert resident.needed(32) > offloaded.needed(32) > plain.needed(32)
     assert offloaded.needed(32) - plain.needed(32) == OFFLOAD_WORKSPACE_BYTES < WORKSPACE_BYTES
-    original = lambda *args: (0, 0)
+    def original(*args):
+        return 0, 0
     info = {"shape": [8, 8], "dtype": "BF16"}
     assert weight_transform(original, True, 0, True)("vision_tower.x", info) == (0, 0)
     assert weight_transform(original, True, 0, False)("vision_tower.x", info) == (128, 0)
+
+
+def test_modelopt_mixed_vision_weights_are_validated_and_budgeted_after_expansion(tmp_path):
+    nvfp4 = "blocks.0.mlp.linear_fc2.weight"
+    mxfp8 = "blocks.0.attn.qkv.weight"
+    entries, stored, logical = _checkpoint(tmp_path, hidden=32, intermediate=64,
+                                           quantized={nvfp4: "nvfp4", mxfp8: "mxfp8"})
+
+    config, resident = checkpoint_vision(tmp_path)
+
+    assert config["hidden_size"] == 32
+    assert stored < logical
+    assert resident == logical
+    assert entries["vision_tower." + nvfp4]["shape"] == [32, 32]
+    assert entries["vision_tower." + nvfp4[:-7] + ".weight_scale_2"]["shape"] == []
+
+
+@pytest.mark.parametrize("damage", ["missing_scale", "bad_scale", "bad_scalar", "orphan_scale"])
+def test_modelopt_vision_loader_rejects_incomplete_quantization_metadata(tmp_path, damage):
+    weight = "blocks.0.mlp.linear_fc2.weight"
+    entries, size, _ = _checkpoint(tmp_path, hidden=32, intermediate=64, quantized={weight: "nvfp4"})
+    scale = "vision_tower." + weight[:-7] + ".weight_scale"
+    scale2 = "vision_tower." + weight[:-7] + ".weight_scale_2"
+    if damage == "missing_scale":
+        del entries[scale]
+    elif damage == "bad_scale":
+        entries[scale]["shape"] = [32, 3]
+    elif damage == "bad_scalar":
+        entries[scale2]["shape"] = [1]
+    else:
+        entries["vision_tower.blocks.0.attn.proj.weight_scale"] = {
+            "dtype": "U8", "shape": [32, 1], "data_offsets": [size, size + 32]}
+    _write_tensors(tmp_path, entries, size)
+    with pytest.raises(ValueError):
+        checkpoint_vision(tmp_path)
+
+
+def test_modelopt_visual_nvfp4_decoder_matches_e2m1_and_nested_e4m3_scales():
+    from tensorfold.vision.qwen_checkpoint import dequantize_vision_nvfp4
+
+    packed = np.zeros((1, 16), dtype=np.uint8)
+    packed[0, 0], packed[0, 8] = 0x10, 0xF8
+    scale = np.full((1, 2), 0x38, dtype=np.uint8)
+    scale[0, 1] = 0x30
+
+    decoded = dequantize_vision_nvfp4(packed, scale, 0.25)
+
+    assert decoded[0, 0] == 0.0
+    assert decoded[0, 1] == 0.125
+    assert decoded[0, 16] == 0.0
+    assert decoded[0, 17] == -0.75
+
+
+def test_modelopt_visual_mxfp8_decoder_uses_e8m0_group_scales():
+    from tensorfold.vision.qwen_checkpoint import dequantize_vision_mxfp8
+
+    weight = np.full((1, 32), 0x38, dtype=np.uint8)
+    weight[0, 1] = 0xB8
+    scale = np.array([[127]], dtype=np.uint8)
+
+    decoded = dequantize_vision_mxfp8(weight, scale)
+
+    assert decoded[0, 0] == 1.0
+    assert decoded[0, 1] == -1.0
+    assert np.all(decoded[0, 2:] == 1.0)
+
+
+def test_modelopt_torch_loader_expands_nvfp4_and_mxfp8_to_bfloat16():
+    torch = pytest.importorskip("torch")
+    from tensorfold.vision.qwen_checkpoint import load_vision_torch_weights
+
+    nv_weight = "blocks.0.mlp.linear_fc2.weight"
+    nv_scale = nv_weight[:-7] + ".weight_scale"
+    nv_scale2 = nv_weight[:-7] + ".weight_scale_2"
+    mx_weight = "blocks.0.attn.qkv.weight"
+    mx_scale = mx_weight[:-7] + ".weight_scale"
+    specs = {
+        nv_weight: ("U8", [1, 16]), nv_scale: ("F8_E4M3", [1, 2]), nv_scale2: ("F32", []),
+        mx_weight: ("F8_E4M3", [1, 32]), mx_scale: ("U8", [1, 1]), "blocks.0.norm1.weight": ("BF16", [1]),
+    }
+    sources = {key: (Path("unused"), {"dtype": dtype, "shape": shape}, 0)
+               for key, (dtype, shape) in specs.items()}
+    mx_values = np.full((1, 32), 0x38, dtype=np.uint8)
+    values = {
+        nv_weight: torch.zeros((1, 16), dtype=torch.uint8),
+        nv_scale: torch.full((1, 2), 0x38, dtype=torch.uint8).view(torch.float8_e4m3fn),
+        nv_scale2: torch.tensor(0.25, dtype=torch.float32),
+        mx_weight: torch.from_numpy(mx_values.copy()).view(torch.float8_e4m3fn),
+        mx_scale: torch.full((1, 1), 127, dtype=torch.uint8),
+        "blocks.0.norm1.weight": torch.tensor([1], dtype=torch.bfloat16),
+    }
+
+    result = load_vision_torch_weights(sources, values.__getitem__, "cpu")
+
+    assert result[nv_weight].dtype == torch.bfloat16 and result[nv_weight].shape == (1, 32)
+    assert result[mx_weight].dtype == torch.bfloat16 and result[mx_weight].shape == (1, 32)
+    assert nv_scale not in result and nv_scale2 not in result and mx_scale not in result
+    assert torch.all(result[mx_weight] == 1)
 
 
 def test_tp_transports_features_and_negative_offset_bit_for_bit(monkeypatch):

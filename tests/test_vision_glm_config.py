@@ -38,3 +38,30 @@ def test_glm_vision_rejects_cuda_before_reading_checkpoint(monkeypatch):
     monkeypatch.setattr(families, 'read_config', read_config)
     with pytest.raises(ValueError, match='GLM.*MLX-only'):
         serve_options.check(Namespace(vision=True), SimpleNamespace(model_type='glm5_next'), 'cuda', 'unused')
+
+
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "qwen3_8_flash_next"])
+def test_flash_next_vision_options_cover_both_model_aliases(model_type, monkeypatch):
+    from types import SimpleNamespace
+
+    from tensorfold import families, serve_options
+    from tensorfold.families import qwen4_exp
+
+    config = {"model_type": model_type, "text_config": {"hidden_size": 2560},
+              "vision_config": {"model_type": "qwen3_5_vision", "out_hidden_size": 2560, "hidden_size": 1024}}
+    monkeypatch.setattr(families, "read_config", lambda _: config)
+    args = SimpleNamespace(vision=True, kv_dtype="int8")
+    family = SimpleNamespace(model_type=model_type, package=qwen4_exp)
+
+    assert serve_options.check(args, family, "cuda", "unused") is None
+    with pytest.raises(ValueError, match="CUDA engine; the MLX path has no image tower"):
+        serve_options.check(args, family, "mlx", "unused")
+
+
+def test_flash_next_family_alias_is_registered_for_vision():
+    from tensorfold.families.qwen4_exp import MODEL_TYPES
+
+    assert "qwen3_8_flash_next" in MODEL_TYPES
+    assert validate_vision_config({"text_config": {"hidden_size": 2560},
+                                   "vision_config": {"out_hidden_size": 2560}},
+                                  "qwen3_8_flash_next")["out_hidden_size"] == 2560
